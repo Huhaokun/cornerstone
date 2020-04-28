@@ -2,7 +2,7 @@ package leader_election
 
 import (
 	"context"
-	"github.com/etcd-io/etcd/clientv3"
+	"go.etcd.io/etcd/clientv3"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -56,6 +56,8 @@ func NewMember(key string, id string, ttl time.Duration) Member {
 		key:       key,
 		id:        id,
 		ttl:       ttl,
+		isRunning: 0,
+		isLeader:  false,
 		stateChan: make(chan StateChange),
 		rootCtx:   ctx,
 		cancel:    cancel,
@@ -66,8 +68,9 @@ func (m *member) Start() {
 	if !atomic.CompareAndSwapInt32(&m.isRunning, 0, 1) {
 		return
 	}
-	m.onStateChange()
-	go m.campaign(m.rootCtx)
+	go m.onStateChange()
+
+	m.stateChan <- StateChange{CANDIDATE, time.Duration(0)}
 }
 
 func (m *member) Stop() {
@@ -89,19 +92,22 @@ func (m *member) onStateChange() {
 			continue
 		}
 
-		log.Printf("state to %d", stateChange.state)
+		log.Printf("[node %s] state to %d", m.id, stateChange.state)
 
 		switch stateChange.state {
 		case FOLLOWER:
+			m.isLeader = false
 			go m.runWithWaitGroup(func(ctx context.Context) {
 				m.observe(ctx, stateChange.data.(int64))
 			})(m.rootCtx)
 		case CANDIDATE:
+			m.isLeader = false
 			// delay execute
 			time.AfterFunc(stateChange.data.(time.Duration), func() {
 				m.runWithWaitGroup(m.campaign)(m.rootCtx)
 			})
 		case LEADER:
+			m.isLeader = true
 			go m.runWithWaitGroup(func(ctx context.Context) {
 				m.keepalive(ctx, stateChange.data.(clientv3.LeaseID))
 			})(m.rootCtx)
@@ -122,8 +128,8 @@ func (m *member) IsLeader() bool {
 }
 
 func (m *member) observe(ctx context.Context, rev int64) {
-	log.Printf("start observe")
-	defer log.Printf("stop observe")
+	log.Printf("[node %s] start observe", m.id)
+	defer log.Printf("[node %s] stop observe", m.id)
 	for resp := range m.client.Watch(ctx, m.key, clientv3.WithRev(rev)) {
 		if resp.Err() != nil || resp.Canceled {
 			// some error happen, we should stop observe
@@ -133,7 +139,7 @@ func (m *member) observe(ctx context.Context, rev int64) {
 		// TODO merge events
 		for _, event := range resp.Events {
 			if event.Type == clientv3.EventTypeDelete {
-				m.stateChan <- StateChange{CANDIDATE, 0}
+				m.stateChan <- StateChange{CANDIDATE, time.Duration(0)}
 				return
 			}
 		}
@@ -141,14 +147,14 @@ func (m *member) observe(ctx context.Context, rev int64) {
 }
 
 func (m *member) campaign(ctx context.Context) {
-	log.Printf("start campaign")
-	defer log.Printf("stop campaign")
+	log.Printf("[node %s] start campaign", m.id)
+	defer log.Printf("[node %s] stop campaign", m.id)
 
 	c, _ := context.WithTimeout(ctx, 5*time.Second)
 
-	lease, err := m.client.Grant(c, m.ttl.Nanoseconds())
+	lease, err := m.client.Grant(c, int64(m.ttl.Seconds()))
 	if err != nil {
-		log.Printf("grant fail due to error %v", err)
+		log.Printf("[node %s] grant fail due to error %v", m.id, err)
 		// delay it maybe
 		m.stateChan <- StateChange{CANDIDATE, time.Second}
 		return
@@ -162,7 +168,7 @@ func (m *member) campaign(ctx context.Context) {
 		Else(clientv3.OpGet(m.key)).
 		Commit()
 	if err != nil {
-		log.Printf("txn fail due to error %v", err)
+		log.Printf("[node %s] txn fail due to error %v", m.id, err)
 		// delay it maybe
 		m.stateChan <- StateChange{CANDIDATE, time.Second}
 		return
@@ -180,13 +186,13 @@ func (m *member) campaign(ctx context.Context) {
 }
 
 func (m *member) keepalive(ctx context.Context, leaseId clientv3.LeaseID) {
-	log.Printf("start keepalive")
+	log.Printf("[node %s] start keepalive", m.id)
 	defer log.Printf("stop keepalive")
 
 	resp, err := m.client.KeepAlive(ctx, leaseId)
 	if err != nil {
-		log.Printf("keep alive failed due to %v", err)
-		m.stateChan <- StateChange{CANDIDATE, 0}
+		log.Printf("[node %s] keep alive failed due to %v", m.id, err)
+		m.stateChan <- StateChange{CANDIDATE, time.Duration(0)}
 		return
 	}
 
@@ -194,5 +200,5 @@ func (m *member) keepalive(ctx context.Context, leaseId clientv3.LeaseID) {
 
 	}
 
-	m.stateChan <- StateChange{CANDIDATE, 0}
+	m.stateChan <- StateChange{CANDIDATE, time.Duration(0)}
 }
